@@ -1,7 +1,23 @@
 import { BUDGET } from "./config.js";
-import { UsageTracker } from "./usage.js";
-import type { Runner } from "./backends.js";
+import { UsageTracker, BudgetExceededError } from "./usage.js";
+import { ProQuotaExceededError, ProBackendUnavailableError, type Runner } from "./backends.js";
 import type { ResearchNote, ResearchReport, CompareReport } from "./types.js";
+
+// One retry for transient failures (network blip, a momentary tool error) —
+// specifically for the research loop, which is the most failure-prone step
+// since it's the only one doing real tool calls out to the network. Doesn't
+// retry a budget stop or a quota/login issue, since retrying those wastes
+// time on something that won't resolve itself.
+async function withRetry<T>(fn: () => Promise<T>, retries = 1, delayMs = 1500): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    const nonRetryable = err instanceof BudgetExceededError || err instanceof ProQuotaExceededError || err instanceof ProBackendUnavailableError;
+    if (retries <= 0 || nonRetryable) throw err;
+    await new Promise((r) => setTimeout(r, delayMs));
+    return withRetry(fn, retries - 1, delayMs);
+  }
+}
 
 // --- Planning ----------------------------------------------------------
 export async function plan(
@@ -39,15 +55,17 @@ export async function research(
     "information — don't pad with searches that don't change the answer. " +
     "Write terse notes (bullet points, not prose), and end with a flat " +
     "list of the source URLs you actually used.";
-  const { text, usage: u } = await runner.text({
-    phase: "research",
-    tier: "researcher",
-    system,
-    prompt: question,
-    webSearch: true,
-    maxSearchTurns: BUDGET.maxSearchTurns,
-    maxTokens: BUDGET.researchTurnMaxTokens,
-  });
+  const { text, usage: u } = await withRetry(() =>
+    runner.text({
+      phase: "research",
+      tier: "researcher",
+      system,
+      prompt: question,
+      webSearch: true,
+      maxSearchTurns: BUDGET.maxSearchTurns,
+      maxTokens: BUDGET.researchTurnMaxTokens,
+    })
+  );
   usage.record(u);
   const sources = [...text.matchAll(/https?:\/\/\S+/g)].map((m) => m[0].replace(/[.,)]+$/, ""));
   return { question, notes: text, sources: [...new Set(sources)] };

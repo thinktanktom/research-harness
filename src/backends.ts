@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import Anthropic from "@anthropic-ai/sdk";
 import { BACKEND_MODELS, PRO_CLI, WEB_SEARCH_TOOL } from "./config.js";
+import type { UsageTracker } from "./usage.js";
 import type { BackendName, UsageEvent, ConversationTurn } from "./types.js";
 
 export type Tier = "scout" | "researcher" | "synthesizer";
@@ -51,8 +52,22 @@ export interface ChatResult {
   proSessionId?: string; // pro backend only — persist this for the next turn
 }
 
-export class ProQuotaExceededError extends Error {}
+export class ProQuotaExceededError extends Error {
+  constructor(message: string, public usage?: UsageEvent) {
+    super(message);
+  }
+}
 export class ProBackendUnavailableError extends Error {}
+// A pro-backend call that failed for a reason other than quota — carries
+// whatever usage Claude Code reported before it failed (so a crash partway
+// through a tool-use loop doesn't silently disappear real spend), and the
+// session_id if one was assigned, so a caller can resume instead of
+// restarting from scratch.
+export class ProCallFailedError extends Error {
+  constructor(message: string, public usage?: UsageEvent, public sessionId?: string) {
+    super(message);
+  }
+}
 
 // ============================================================================
 // API backend — calls the Anthropic SDK directly, billed per-token against
@@ -161,7 +176,7 @@ function looksLikeQuotaError(message: string): boolean {
   return QUOTA_PATTERNS.some((p) => p.test(message));
 }
 
-function runClaudeCli(args: string[]): Promise<{ stdout: string; code: number }> {
+function runClaudeCli(args: string[]): Promise<{ stdout: string; stderr: string; code: number }> {
   return new Promise((resolve, reject) => {
     // Strip any API key from the child's env so it can't silently bill your
     // Console balance behind your back — if it's not logged in via
@@ -172,7 +187,9 @@ function runClaudeCli(args: string[]): Promise<{ stdout: string; code: number }>
 
     const child = spawn(PRO_CLI.binary, args, { env });
     let stdout = "";
+    let stderr = "";
     child.stdout.on("data", (d) => (stdout += d));
+    child.stderr.on("data", (d) => (stderr += d));
     child.on("error", (err: NodeJS.ErrnoException) => {
       if (err.code === "ENOENT") {
         reject(new ProBackendUnavailableError(`'${PRO_CLI.binary}' not found on PATH. Is Claude Code installed and logged in ('claude login')?`));
@@ -180,13 +197,13 @@ function runClaudeCli(args: string[]): Promise<{ stdout: string; code: number }>
         reject(err);
       }
     });
-    child.on("close", (code) => resolve({ stdout, code: code ?? 1 }));
+    child.on("close", (code) => resolve({ stdout, stderr, code: code ?? 1 }));
   });
 }
 
-function baseArgs(spec: CallSpec, maxTurns: number): string[] {
+function baseArgs(spec: CallSpec, maxTurns: number, restrictTools = true): string[] {
   const model = BACKEND_MODELS.pro[spec.tier];
-  return [
+  const args = [
     "-p",
     spec.prompt,
     "--model",
@@ -198,25 +215,54 @@ function baseArgs(spec: CallSpec, maxTurns: number): string[] {
     "--permission-mode",
     PRO_CLI.permissionMode,
     ...(PRO_CLI.bare ? ["--bare"] : []),
-    "--allowedTools",
-    spec.webSearch ? "WebSearch" : "",
     "--max-turns",
     String(maxTurns),
   ];
+  // Only restrict tools for plain-text calls (plan/research). Structured
+  // (--json-schema) calls skip this: blocking all tools apparently also
+  // blocks whatever internal mechanism Claude Code uses to emit
+  // schema-validated output — confirmed by a real failure where a synthesis
+  // call with --allowedTools "" silently fell back to a plain-text
+  // explanation instead of the requested JSON. --permission-mode dontAsk
+  // still prevents interactive prompts either way.
+  if (restrictTools) {
+    args.push("--allowedTools", spec.webSearch ? "WebSearch" : "");
+  }
+  return args;
 }
 
-function parseProResult(stdout: string, code: number): any {
-  const lastLine = stdout.trim().split("\n").filter(Boolean).pop() ?? "{}";
-  let parsed: any;
-  try {
-    parsed = JSON.parse(lastLine);
-  } catch {
-    throw new Error(`Claude Code returned non-JSON output (exit ${code}): ${stdout.slice(0, 300)}`);
+// Only throws for the two cases where there's genuinely nothing to extract:
+// no output at all, or output that isn't valid JSON. A well-formed error
+// result (is_error: true) is returned as-is — the caller checks that, since
+// it's the caller (not this function) that knows the phase/model needed to
+// build a usage event from whatever Claude Code reports it spent before failing.
+function parseProResult(stdout: string, stderr: string, code: number): any {
+  const trimmed = stdout.trim();
+  if (!trimmed) {
+    const detail = stderr.trim()
+      ? `stderr: ${stderr.trim().slice(0, 500)}`
+      : "stderr was also empty — process likely killed or crashed before writing anything. Try running the same call by hand (see baseArgs() for the exact flags) to see the interactive error.";
+    throw new Error(`Claude Code exited with code ${code} and produced no output on stdout. ${detail}`);
   }
+  const lastLine = trimmed.split("\n").filter(Boolean).pop()!;
+  try {
+    return JSON.parse(lastLine);
+  } catch {
+    const detail = stderr.trim() ? `\nstderr: ${stderr.trim().slice(0, 300)}` : "";
+    throw new Error(`Claude Code returned non-JSON output (exit ${code}): ${trimmed.slice(0, 300)}${detail}`);
+  }
+}
+
+// Checks a parsed result for is_error/non-zero exit. If it failed, builds a
+// usage event from whatever Claude Code reported (real work isn't lost just
+// because the call ultimately errored) and throws it attached to the error,
+// so callers can record it before deciding whether to retry/fall back.
+function checkProResult(parsed: any, code: number, stderr: string, phase: string, model: string): any {
   if (parsed.is_error || code !== 0) {
-    const message = String(parsed.result ?? `exit code ${code}`);
-    if (looksLikeQuotaError(message)) throw new ProQuotaExceededError(message);
-    throw new Error(`Claude Code error: ${message}`);
+    const message = String(parsed.result ?? (stderr.trim() ? stderr.trim().slice(0, 500) : `exit code ${code}, no result field, no stderr`));
+    const usage = usageFromProResult(`${phase}:failed`, model, parsed);
+    if (looksLikeQuotaError(message)) throw new ProQuotaExceededError(message, usage);
+    throw new ProCallFailedError(message, usage, parsed.session_id);
   }
   return parsed;
 }
@@ -237,19 +283,80 @@ function usageFromProResult(phase: string, model: string, parsed: any): UsageEve
 export class ProBackend {
   readonly name: BackendName = "pro";
 
+  // If the first attempt failed but left a session_id (a "graceful" error —
+  // Claude Code wrote a result, just an unsuccessful one), resume that exact
+  // session with a short continuation nudge instead of resending the whole
+  // original prompt. Whatever tool calls/turns already happened before the
+  // failure stay in the session server-side, so we're not paying quota to
+  // redo them. If there's no session_id (a silent crash — no output at
+  // all), there's nothing to resume; this just rethrows and the caller's
+  // own from-scratch retry (see pipeline.ts's withRetry) is the fallback.
+  private async runWithResumeOnFailure(
+    initialArgs: string[],
+    spec: CallSpec,
+    continuationNote: string,
+    restrictTools = true,
+    schema?: Record<string, unknown>
+  ): Promise<any> {
+    const model = BACKEND_MODELS.pro[spec.tier];
+    try {
+      const { stdout, stderr, code } = await runClaudeCli(initialArgs);
+      return checkProResult(parseProResult(stdout, stderr, code), code, stderr, spec.phase, model);
+    } catch (err) {
+      if (!(err instanceof ProCallFailedError) || !err.sessionId) throw err;
+      const resumeArgs = [
+        "-p",
+        continuationNote,
+        "--model",
+        model,
+        "--output-format",
+        "json",
+        "--permission-mode",
+        PRO_CLI.permissionMode,
+        ...(restrictTools ? ["--allowedTools", spec.webSearch ? "WebSearch" : ""] : []),
+        "--max-turns",
+        String(spec.webSearch ? 4 : 2),
+        "--resume",
+        err.sessionId,
+        ...(schema ? ["--json-schema", JSON.stringify(schema)] : []),
+      ];
+      const { stdout, stderr, code } = await runClaudeCli(resumeArgs);
+      return checkProResult(parseProResult(stdout, stderr, code), code, stderr, `${spec.phase}:resumed`, model);
+      // Deliberately not caught again — if the resume attempt also fails,
+      // that error (with its own usage/sessionId) propagates as-is. One
+      // resume attempt, not a loop; pipeline.ts's retry is the outer net.
+    }
+  }
+
   async completeText(spec: CallSpec): Promise<CallResult> {
     const maxTurns = spec.webSearch ? (spec.maxSearchTurns ?? 6) + 2 : 2;
-    const { stdout, code } = await runClaudeCli(baseArgs(spec, maxTurns));
-    const parsed = parseProResult(stdout, code);
+    const parsed = await this.runWithResumeOnFailure(
+      baseArgs(spec, maxTurns),
+      spec,
+      "The previous attempt was interrupted before finishing. Please continue from where you left off " +
+        "and give your complete answer now — don't repeat searches or work you already did."
+    );
     return { text: String(parsed.result ?? ""), usage: usageFromProResult(spec.phase, BACKEND_MODELS.pro[spec.tier], parsed) };
   }
 
   async completeStructured(spec: StructuredCallSpec): Promise<StructuredCallResult> {
-    const args = [...baseArgs(spec, 2), "--json-schema", JSON.stringify(spec.schema)];
-    const { stdout, code } = await runClaudeCli(args);
-    const parsed = parseProResult(stdout, code);
-    const data = parsed.structured_output ?? JSON.parse(parsed.result);
-    return { data, usage: usageFromProResult(spec.phase, BACKEND_MODELS.pro[spec.tier], parsed) };
+    const args = [...baseArgs(spec, 2, /* restrictTools */ false), "--json-schema", JSON.stringify(spec.schema)];
+    const parsed = await this.runWithResumeOnFailure(
+      args,
+      spec,
+      "The previous attempt was interrupted before you submitted your result. Please continue and " +
+        "call the required tool now with your complete answer — don't repeat work you already did.",
+      /* restrictTools */ false,
+      spec.schema
+    );
+    if (!parsed.structured_output) {
+      throw new Error(
+        `Claude Code returned no structured_output for a --json-schema call (result was: ` +
+          `${String(parsed.result ?? "").slice(0, 200)}). The model likely couldn't fulfill the schema — ` +
+          `check the system/prompt for this phase.`
+      );
+    }
+    return { data: parsed.structured_output, usage: usageFromProResult(spec.phase, BACKEND_MODELS.pro[spec.tier], parsed) };
   }
 
   // Turn 1: send the static context + question together, capture the
@@ -276,8 +383,8 @@ export class ProBackend {
       "2",
       ...(spec.proSessionId ? ["--resume", spec.proSessionId] : []),
     ];
-    const { stdout, code } = await runClaudeCli(args);
-    const parsed = parseProResult(stdout, code);
+    const { stdout, stderr, code } = await runClaudeCli(args);
+    const parsed = checkProResult(parseProResult(stdout, stderr, code), code, stderr, spec.phase, model);
     return {
       answer: String(parsed.result ?? ""),
       usage: usageFromProResult(spec.phase, model, parsed),
@@ -304,6 +411,7 @@ export class Runner {
   constructor(
     apiClient: Anthropic,
     private mode: BackendMode,
+    private usageTracker: UsageTracker,
     private onFallback: (reason: string) => void
   ) {
     this.api = new ApiBackend(apiClient);
@@ -313,11 +421,20 @@ export class Runner {
     return this.mode !== "api" && !this.exhausted;
   }
 
+  // Records whatever Claude Code reported it had spent before a call failed
+  // — a mid-loop crash doesn't just vanish because the call ultimately
+  // errored. Applies whether we're about to retry, fall back, or give up.
+  private recordPartialUsage(err: unknown) {
+    const usage = (err as { usage?: UsageEvent }).usage;
+    if (usage) this.usageTracker.record(usage);
+  }
+
   private async withFallback<T>(run: (backend: ApiBackend | ProBackend) => Promise<T>): Promise<T> {
     if (this.preferPro) {
       try {
         return await run(this.pro);
       } catch (err) {
+        this.recordPartialUsage(err);
         if (this.mode === "pro") throw err; // pinned to pro — surface the real error
         if (err instanceof ProQuotaExceededError || err instanceof ProBackendUnavailableError) {
           this.exhausted = true;
