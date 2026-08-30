@@ -1,29 +1,35 @@
-import type { ResearchReport, CompareReport } from "./types.js";
+import type { ResearchReport, CompareReport, GlossaryEntry } from "./types.js";
+
+function renderGlossary(glossary: GlossaryEntry[]): string[] {
+  if (!glossary?.length) return [];
+  const lines = ["", "## Terms used above, in plain language", ""];
+  for (const g of glossary) lines.push(`- **${g.term}** — ${g.plain_explanation}`);
+  return lines;
+}
+
+function renderSources(sources: string[]): string[] {
+  if (!sources?.length) return [];
+  return ["", "## Sources", "", ...sources.map((s) => `- ${s}`)];
+}
+
+function renderActionItems(items: string[]): string[] {
+  if (!items?.length) return [];
+  return ["", "## Action Items", "", ...items.map((a) => `- [ ] ${a}`)];
+}
 
 export function renderResearchMarkdown(report: ResearchReport): string {
-  const lines: string[] = [];
-  lines.push(`# ${report.topic}`, "");
+  const lines: string[] = [`# ${report.topic}`, ""];
   if (report.context) lines.push(`_Context: ${report.context}_`, "");
-  lines.push(report.summary, "", "## Findings", "");
-  for (const f of report.findings) {
-    lines.push(`- **[${f.confidence}]** ${f.statement}`);
-    if (f.sources.length) lines.push(`  - Sources: ${f.sources.join(", ")}`);
-  }
+  lines.push(report.explainer);
+  lines.push(...renderGlossary(report.glossary));
   lines.push("", "## Recommendation", "", report.recommendation);
-  if (report.action_items.length) {
-    lines.push("", "## Action Items", "");
-    for (const a of report.action_items) lines.push(`- [ ] ${a}`);
-  }
-  if (report.open_questions.length) {
-    lines.push("", "## Open Questions", "");
-    for (const q of report.open_questions) lines.push(`- ${q}`);
-  }
+  lines.push(...renderActionItems(report.action_items));
+  lines.push(...renderSources(report.sources));
   return lines.join("\n");
 }
 
 export function renderCompareMarkdown(report: CompareReport): string {
-  const lines: string[] = [];
-  lines.push(`# ${report.decision}`, "");
+  const lines: string[] = [`# ${report.decision}`, ""];
   if (report.context) lines.push(`_Context: ${report.context}_`, "");
   lines.push("## Options", "");
   for (const o of report.options) {
@@ -32,13 +38,8 @@ export function renderCompareMarkdown(report: CompareReport): string {
     if (o.cons.length) lines.push("**Cons**", ...o.cons.map((c) => `- ${c}`), "");
   }
   lines.push("## Recommendation", "", `**${report.recommendation}**`, "", report.rationale);
-  if (report.action_items.length) {
-    lines.push("", "## Action Items", "");
-    for (const a of report.action_items) lines.push(`- [ ] ${a}`);
-  }
-  if (report.open_questions.length) {
-    lines.push("", "## Open Questions", "");
-    for (const q of report.open_questions) lines.push(`- ${q}`);
-  }
+  lines.push(...renderGlossary(report.glossary));
+  lines.push(...renderActionItems(report.action_items));
+  lines.push(...renderSources(report.sources));
   return lines.join("\n");
 }

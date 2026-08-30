@@ -2,10 +2,9 @@ export interface ResearchPlan {
   questions: string[];
 }
 
-export interface Claim {
-  statement: string;
-  confidence: "high" | "medium" | "low";
-  sources: string[];
+export interface GlossaryEntry {
+  term: string;
+  plain_explanation: string;
 }
 
 export interface ResearchNote {
@@ -17,11 +16,16 @@ export interface ResearchNote {
 export interface ResearchReport {
   topic: string;
   context?: string;
-  summary: string;
-  findings: Claim[];
+  // The main content: multi-paragraph plain-language prose covering what it
+  // is, what problem it solves, and how it actually works — with jargon
+  // explained inline the first time it appears, and uncertainty stated in
+  // the prose itself ("the project claims X, though nothing independent
+  // confirms it") rather than in a separate confidence column.
+  explainer: string;
+  glossary: GlossaryEntry[];
   recommendation: string;
   action_items: string[];
-  open_questions: string[];
+  sources: string[];
 }
 
 export interface OptionAssessment {
@@ -34,10 +38,11 @@ export interface CompareReport {
   decision: string;
   context?: string;
   options: OptionAssessment[];
+  glossary: GlossaryEntry[];
   recommendation: string;
   rationale: string;
   action_items: string[];
-  open_questions: string[];
+  sources: string[];
 }
 
 export interface ConversationTurn {
