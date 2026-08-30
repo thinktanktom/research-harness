@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import Anthropic from "@anthropic-ai/sdk";
-import { BACKEND_MODELS, PRO_CLI, WEB_SEARCH_TOOL } from "./config.js";
+import { BACKEND_MODELS, PRO_CLI, WEB_SEARCH_TOOL, WEB_FETCH_TOOL, WEB_FETCH_BETA } from "./config.js";
 import type { UsageTracker } from "./usage.js";
 import type { BackendName, UsageEvent, ConversationTurn } from "./types.js";
 
@@ -98,15 +98,25 @@ export class ApiBackend {
       spec.tier === "researcher"
         ? [{ type: "text" as const, text: spec.system, cache_control: { type: "ephemeral" as const } }]
         : spec.system;
-    const resp = await this.client.messages.create({
-      model,
-      max_tokens: spec.maxTokens,
-      system,
-      tools: spec.webSearch ? [WEB_SEARCH_TOOL] : undefined,
-      messages: [{ role: "user", content: spec.prompt }],
-    });
+    const messages = [{ role: "user" as const, content: spec.prompt }];
+    // web_fetch (loading a specific URL) rides alongside web_search (a
+    // search-engine query) — they solve different problems, and a call that
+    // names an exact source needs the former, not just the latter. It's a
+    // beta capability (hence the separate beta.messages.create branch); kept
+    // as a distinct branch rather than a shared params object because the
+    // stable and beta tool unions aren't structurally compatible types.
+    const resp = spec.webSearch
+      ? await this.client.beta.messages.create({
+          model,
+          max_tokens: spec.maxTokens,
+          system,
+          tools: [WEB_SEARCH_TOOL, WEB_FETCH_TOOL],
+          messages,
+          betas: [WEB_FETCH_BETA],
+        })
+      : await this.client.messages.create({ model, max_tokens: spec.maxTokens, system, messages });
     const text = resp.content.filter((b) => b.type === "text").map((b: any) => b.text).join("\n");
-    return { text, usage: usageFromApiResponse(spec.phase, model, resp) };
+    return { text, usage: usageFromApiResponse(spec.phase, model, resp as Anthropic.Message) };
   }
 
   async completeStructured(spec: StructuredCallSpec): Promise<StructuredCallResult> {
@@ -226,7 +236,10 @@ function baseArgs(spec: CallSpec, maxTurns: number, restrictTools = true): strin
   // explanation instead of the requested JSON. --permission-mode dontAsk
   // still prevents interactive prompts either way.
   if (restrictTools) {
-    args.push("--allowedTools", spec.webSearch ? "WebSearch" : "");
+    // WebFetch alongside WebSearch: search finds pages, fetch actually
+    // loads a specific URL's content — a call naming an exact source needs
+    // both, not just search.
+    args.push("--allowedTools", spec.webSearch ? "WebSearch,WebFetch" : "");
   }
   return args;
 }
@@ -313,7 +326,7 @@ export class ProBackend {
         "json",
         "--permission-mode",
         PRO_CLI.permissionMode,
-        ...(restrictTools ? ["--allowedTools", spec.webSearch ? "WebSearch" : ""] : []),
+        ...(restrictTools ? ["--allowedTools", spec.webSearch ? "WebSearch,WebFetch" : ""] : []),
         "--max-turns",
         String(spec.webSearch ? 4 : 2),
         "--resume",

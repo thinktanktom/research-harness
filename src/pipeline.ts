@@ -3,6 +3,30 @@ import { UsageTracker, BudgetExceededError } from "./usage.js";
 import { ProQuotaExceededError, ProBackendUnavailableError, type Runner } from "./backends.js";
 import type { ResearchNote, ResearchReport, CompareReport } from "./types.js";
 
+export const SOURCE_UNREACHABLE_MARKER = "SOURCE UNREACHABLE";
+
+export function extractUrls(text: string): string[] {
+  return [...new Set([...text.matchAll(/https?:\/\/\S+/g)].map((m) => m[0].replace(/[.,)]+$/, "")))];
+}
+
+// Checks a research note for the "couldn't verify the named source" flag,
+// and returns which URL it was about (best effort — falls back to the
+// first candidate if the note didn't quote the URL back exactly).
+export function flaggedUnreachableUrl(noteText: string, candidateUrls: string[]): string | null {
+  if (!noteText.includes(SOURCE_UNREACHABLE_MARKER)) return null;
+  return candidateUrls.find((u) => noteText.includes(u)) ?? candidateUrls[0] ?? null;
+}
+
+// Thrown by the caller (harness.ts), not by research() itself — research()
+// just reports what happened; the decision to stop the run belongs to the
+// orchestration layer, which knows about --ignore-unreachable and what's
+// already been spent.
+export class SourceUnreachableError extends Error {
+  constructor(public url: string) {
+    super(`Couldn't verify the source you named: ${url}\nStopping here rather than synthesizing a report built on substitutes. Run with --ignore-unreachable to proceed anyway.`);
+  }
+}
+
 // One retry for transient failures (network blip, a momentary tool error) —
 // specifically for the research loop, which is the most failure-prone step
 // since it's the only one doing real tool calls out to the network. Doesn't
@@ -47,20 +71,35 @@ export async function research(
   question: string,
   context?: string
 ): Promise<ResearchNote> {
+  const topicUrls = extractUrls(topic);
   const contextLine = context ? `\nProject context (weigh relevance against this): ${context}` : "";
+  const urlInstruction = topicUrls.length
+    ? `\nThe topic names a specific source: ${topicUrls.join(", ")}. Fetch it directly (don't just ` +
+      "search for related pages) and base your answer on what's actually there. If you cannot access " +
+      `it after trying, write "${SOURCE_UNREACHABLE_MARKER}: <url>" as the very first line of your notes ` +
+      "and stop there — do NOT substitute a similarly-named or related project as if it might be the " +
+      "same thing, even if search turns up something that looks close."
+    : "";
   const system =
     `You research one specific sub-question as part of a larger effort on "${topic}".` +
     contextLine +
+    urlInstruction +
     " Search only as much as needed to answer it with current, specific " +
     "information — don't pad with searches that don't change the answer. " +
     "Write terse notes (bullet points, not prose), and end with a flat " +
     "list of the source URLs you actually used.";
+  // The literal URL(s) also go in the user-turn content, not just the
+  // system prompt: web_fetch/WebFetch can only target a URL that has
+  // actually appeared in the conversation (a deliberate anti-exfiltration
+  // restriction), and message content is the safest place to guarantee
+  // that rather than relying on the system field counting.
+  const prompt = topicUrls.length ? `${question}\n\nSource(s) to check directly: ${topicUrls.join(", ")}` : question;
   const { text, usage: u } = await withRetry(() =>
     runner.text({
       phase: "research",
       tier: "researcher",
       system,
-      prompt: question,
+      prompt,
       webSearch: true,
       maxSearchTurns: BUDGET.maxSearchTurns,
       maxTokens: BUDGET.researchTurnMaxTokens,

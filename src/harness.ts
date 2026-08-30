@@ -4,7 +4,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { BUDGET } from "./config.js";
 import { UsageTracker, BudgetExceededError } from "./usage.js";
 import { Runner, type BackendMode } from "./backends.js";
-import { plan, research, synthesizeResearch, synthesizeCompare } from "./pipeline.js";
+import { plan, research, synthesizeResearch, synthesizeCompare, extractUrls, flaggedUnreachableUrl, SourceUnreachableError } from "./pipeline.js";
 import { runDir, saveNotes, loadNotes, saveJson, saveText } from "./store.js";
 import { renderResearchMarkdown, renderCompareMarkdown } from "./render.js";
 import { runAskOnce, runAskRepl } from "./ask.js";
@@ -22,16 +22,17 @@ const apiClient = new Anthropic({
 const usage = new UsageTracker();
 
 function makeRunner(mode: BackendMode): Runner {
-  return new Runner(apiClient, mode, (reason) => {
+  return new Runner(apiClient, mode, usage, (reason) => {
     console.error(`\n⚠ Pro plan unavailable, switching to API billing for the rest of this run.`);
     console.error(`  Reason: ${reason}\n`);
   });
 }
 
 // --- Mode: research ------------------------------------------------------
-async function runResearch(runner: Runner, topic: string, context?: string, fromNotesPath?: string) {
+async function runResearch(runner: Runner, topic: string, context?: string, fromNotesPath?: string, ignoreUnreachable = false) {
   let notes: ResearchNote[];
   const dir = runDir(topic);
+  const topicUrls = extractUrls(topic);
 
   if (fromNotesPath) {
     console.error(`Re-synthesizing from ${fromNotesPath} (no new searches)`);
@@ -53,8 +54,19 @@ async function runResearch(runner: Runner, topic: string, context?: string, from
     for (const q of questions) {
       try {
         console.error(`Researching: ${q}`);
-        notes.push(await research(runner, usage, topic, q, context));
+        const note = await research(runner, usage, topic, q, context);
+        notes.push(note);
+        if (!ignoreUnreachable && topicUrls.length) {
+          const unreachable = flaggedUnreachableUrl(note.notes, topicUrls);
+          if (unreachable) {
+            saveNotes(dir, notes);
+            console.error(`\n--- Usage (partial — stopped before synthesis) ---`);
+            console.error(usage.report());
+            throw new SourceUnreachableError(unreachable);
+          }
+        }
       } catch (err) {
+        if (err instanceof SourceUnreachableError) throw err;
         if (err instanceof BudgetExceededError) {
           console.error(`Budget hit mid-research — synthesizing with ${notes.length}/${questions.length} notes`);
           break;
@@ -78,8 +90,9 @@ async function runResearch(runner: Runner, topic: string, context?: string, from
 }
 
 // --- Mode: compare ---------------------------------------------------------
-async function runCompare(runner: Runner, decision: string, options: string[], context?: string) {
+async function runCompare(runner: Runner, decision: string, options: string[], context?: string, ignoreUnreachable = false) {
   const dir = runDir(decision);
+  const decisionUrls = extractUrls(decision + " " + (context ?? ""));
 
   console.error(`Planning comparison: ${decision} (${options.join(" vs ")})`);
   const axes = await plan(
@@ -99,8 +112,19 @@ async function runCompare(runner: Runner, decision: string, options: string[], c
     try {
       console.error(`Researching axis: ${axis}`);
       const question = `Compare ${options.join(" vs ")} on: ${axis}`;
-      notes.push(await research(runner, usage, decision, question, context));
+      const note = await research(runner, usage, decision, question, context);
+      notes.push(note);
+      if (!ignoreUnreachable && decisionUrls.length) {
+        const unreachable = flaggedUnreachableUrl(note.notes, decisionUrls);
+        if (unreachable) {
+          saveNotes(dir, notes);
+          console.error(`\n--- Usage (partial — stopped before synthesis) ---`);
+          console.error(usage.report());
+          throw new SourceUnreachableError(unreachable);
+        }
+      }
     } catch (err) {
+      if (err instanceof SourceUnreachableError) throw err;
       if (err instanceof BudgetExceededError) {
         console.error(`Budget hit mid-research — synthesizing with ${notes.length}/${axes.length} axes`);
         break;
@@ -134,6 +158,7 @@ const { values, positionals } = parseArgs({
     "from-report": { type: "string" }, // ask mode: run directory to load
     ask: { type: "string" }, // ask mode: single non-interactive question
     "with-raw-notes": { type: "boolean", default: false }, // ask mode: include notes.json, not just report.json
+    "ignore-unreachable": { type: "boolean", default: false }, // proceed to synthesis even if a named source couldn't be verified
   },
   allowPositionals: true,
 });
@@ -158,10 +183,10 @@ async function main() {
     if (!subject) throw new Error('compare mode needs a decision, e.g. --mode compare "testing framework" --options "Hardhat,Foundry"');
     if (!values.options) throw new Error('compare mode needs --options "A,B,C"');
     const options = values.options.split(",").map((o) => o.trim()).filter(Boolean);
-    await runCompare(runner, subject, options, values.context);
+    await runCompare(runner, subject, options, values.context, values["ignore-unreachable"]);
   } else {
     if (!subject && !values["from-notes"]) throw new Error("research mode needs a topic");
-    await runResearch(runner, subject || "re-synthesis", values.context, values["from-notes"]);
+    await runResearch(runner, subject || "re-synthesis", values.context, values["from-notes"], values["ignore-unreachable"]);
   }
 }
 

@@ -52,6 +52,21 @@ export const WEB_SEARCH_TOOL = {
   max_uses: BUDGET.maxSearchTurns,
 };
 
+// Fetches a specific URL directly (as opposed to web_search, which only
+// runs search-engine queries and can't load a given page's actual content).
+// Requires the beta header below on the API backend. Anthropic restricts
+// this tool to URLs that have already appeared in the conversation — it
+// can't dynamically construct or invent URLs to fetch — so the literal URL
+// text has to be in the prompt for this to do anything (see pipeline.ts's
+// research(), which puts it in the message content, not just the system
+// prompt, specifically for this reason).
+export const WEB_FETCH_TOOL = {
+  type: "web_fetch_20250910" as const,
+  name: "web_fetch" as const,
+  max_uses: 5,
+};
+export const WEB_FETCH_BETA = "web-fetch-2025-09-10";
+
 export const PRO_CLI = {
   binary: "claude",
   permissionMode: "dontAsk",
