@@ -13,7 +13,10 @@ commands:
   # Node's built-in test runner over the TS sources via the tsx loader.
   test: "npm test"
   # Real typecheck using the typescript devDependency already in the repo.
-  lint: "npx --no-install tsc --noEmit"
+  # --allowImportingTsExtensions: the *.test.ts files import ./foo.ts with an
+  # explicit extension (required by the node --import tsx test runner); this
+  # flag lets tsc accept those specifiers under --noEmit.
+  lint: "npx --no-install tsc --noEmit --allowImportingTsExtensions"
   # No formatter in this repo; `format` intentionally left unset.
 
 # Do not let the agent silently rewrite tests or code to get past a stage.
