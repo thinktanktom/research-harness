@@ -1,0 +1,30 @@
+# no-mistakes validation gate — research-harness
+# Personal repo (origin: git@github.com:thinktanktom/research-harness.git).
+# Config is honored only from the trusted default branch (main) at a pinned SHA.
+
+# Drive the locally-authenticated `claude` CLI for the review/intent/document stages.
+# No ANTHROPIC_API_KEY — cost is subscription quota, not API dollars.
+agent: claude
+
+# All commands run via `sh -c` from the repo root inside the gate's worktree.
+commands:
+  # Dependency prep — the gate worktree is a fresh checkout with no node_modules.
+  prepare: "npm ci --no-audit --no-fund"
+  # Node's built-in test runner over the TS sources via the tsx loader.
+  test: "npm test"
+  # Real typecheck using the typescript devDependency already in the repo.
+  lint: "npx --no-install tsc --noEmit"
+  # No formatter in this repo; `format` intentionally left unset.
+
+# Keep AI review scoped to the diff.
+review:
+  path_instructions:
+    - path: "src/**"
+      instructions: >
+        TypeScript ESM project. Review only the changed lines in the diff.
+        Do not request new test coverage for code that was not touched.
+
+# Paths the gate should not treat as project changes.
+ignore_patterns:
+  - "reports/**"
+  - ".lavish/**"

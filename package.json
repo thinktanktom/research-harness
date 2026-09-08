@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "research": "tsx src/harness.ts"
+    "research": "tsx src/harness.ts",
+    "test": "node --import tsx --test 'src/**/*.test.ts'"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.68.0",
