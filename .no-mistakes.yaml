@@ -16,6 +16,13 @@ commands:
   lint: "npx --no-install tsc --noEmit"
   # No formatter in this repo; `format` intentionally left unset.
 
+# Do not let the agent silently rewrite tests or code to get past a stage.
+# A failing test or a blocking review finding parks for a human decision
+# instead of being auto-patched.
+auto_fix:
+  review: 0
+  test: 0
+
 # Keep AI review scoped to the diff.
 review:
   path_instructions:
