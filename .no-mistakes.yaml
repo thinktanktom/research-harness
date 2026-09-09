@@ -34,6 +34,13 @@ review:
         TypeScript ESM project. Review only the changed lines in the diff.
         Do not request new test coverage for code that was not touched.
 
+# Paths the gate must not modify without an explicit operator override.
+protected_paths:
+  - "**/.env"
+  - "**/.env.*"
+  - "**/*.pem"
+  - "**/*.key"
+
 # Paths the gate should not treat as project changes.
 ignore_patterns:
   - "reports/**"
