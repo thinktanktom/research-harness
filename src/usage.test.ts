@@ -38,3 +38,11 @@ test("pro-backend equivalent cost is summed for visibility", () => {
 test("BudgetExceededError is an Error subclass", () => {
   assert.ok(new BudgetExceededError("x") instanceof Error);
 });
+
+test("countByBackend also tallies api-backend events", () => {
+  const u = new UsageTracker();
+  u.record(proEvent({ backend: "api", model: "claude-sonnet-5" }));
+  u.record(proEvent());
+  u.record(proEvent());
+  assert.deepEqual(u.countByBackend(), { api: 1, pro: 2 });
+});
