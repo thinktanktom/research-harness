@@ -1,0 +1,41 @@
+name: CI
+
+# Mirrors the canonical checks in .no-mistakes.yaml so the no-mistakes gate's
+# `ci` step has real GitHub checks to monitor. Keep the run: lines in sync with
+# commands.{prepare,lint,test} in .no-mistakes.yaml.
+#
+# NOTE: `no-mistakes ci-workflow` generates a Go-shaped workflow (actions/setup-go,
+# go.mod). This file was hand-corrected for this Node/TypeScript repo. Re-running
+# `no-mistakes ci-workflow -f` will clobber it with the Go template again.
+
+on:
+  push:
+    branches: ['main']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Prepare
+        run: npm ci --no-audit --no-fund
+
+      - name: Lint
+        run: npx --no-install tsc --noEmit --allowImportingTsExtensions
+
+      - name: Test
+        run: npm test
